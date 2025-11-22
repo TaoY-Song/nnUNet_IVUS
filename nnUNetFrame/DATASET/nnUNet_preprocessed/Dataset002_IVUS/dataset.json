@@ -1,0 +1,15 @@
+{
+    "channel_names": {
+        "0": "IVUS"
+    },
+    "labels": {
+        "background": 0,
+        "lumen": 1,
+        "cacified": 2,
+        "non-calcified": 3
+    },
+    "numTraining": 135,
+    "file_ending": ".nii.gz",
+    "name": "IVUS",
+    "overwrite_image_reader_writer": "SimpleITKIO"
+}

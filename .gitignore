@@ -116,5 +116,10 @@ ENV/
 !documentation/assets/scribble_example.png
 
 #data
-/nnUNetFrame/DATASET
-/nnUNet-我的代码/nnUNetFrame/DATASET
+**/*.nii
+**/*.nii.gz
+**/*.pkl
+**/*.npz
+**/*.pt
+**/*.pth
+**/*.b2nd
