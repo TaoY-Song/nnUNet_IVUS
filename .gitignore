@@ -123,3 +123,8 @@ ENV/
 **/*.pt
 **/*.pth
 **/*.b2nd
+**/*.txt
+**/*.json
+
+# 允许追踪 nnUNetFrame/DATASET/nnUNet_raw/ 下的 JSON
+!nnUNetFrame/DATASET/nnUNet_raw/**/*.json

@@ -148,7 +148,7 @@ class nnUNetTrainer(object):
         self.probabilistic_oversampling = False
         self.num_iterations_per_epoch = 250
         self.num_val_iterations_per_epoch = 50
-        self.num_epochs = 1000
+        self.num_epochs = 300
         self.current_epoch = 0
         self.enable_deep_supervision = True
 
@@ -1019,25 +1019,25 @@ class nnUNetTrainer(object):
 
     def on_train_epoch_end(self, train_outputs: List[dict]):
         outputs = collate_outputs(train_outputs)
-        
+                
         # [修改] 检查 train 和 val 中是否有 NaN
         if hasattr(self, 'is_nan_train') and self.is_nan_train:
             if not hasattr(self, 'nan_loss_count'):
                 self.nan_loss_count = 0
             self.nan_loss_count += 1
-            print(f"loss count = {self.nan_loss_count}")
+            print(f"loss count = {self.nan_loss_count}", flush=True)
             
             if (self.nan_loss_count + 1) == self.save_every:
-                print(f"Error: Detected NaN in train_loss for consecutive epochs. Training terminated. current_epoch={self.current_epoch}")
+                print(f"NaN detected, current_epoch={self.current_epoch}", flush=True)
                 exit(1)
         elif hasattr(self, 'is_nan_val') and self.is_nan_val:
             if not hasattr(self, 'nan_loss_count'):
                 self.nan_loss_count = 0
             self.nan_loss_count += 1
-            print(f"loss count = {self.nan_loss_count}")
+            print(f"loss count = {self.nan_loss_count}", flush=True)
             
             if (self.nan_loss_count + 1) == self.save_every:
-                print(f"Error: Detected NaN in val_loss for consecutive epochs. Training terminated. current_epoch={self.current_epoch}")
+                print(f"NaN detected, current_epoch={self.current_epoch}", flush=True)
                 exit(1)
         else:
             # 只有在 train 和 val 都没有 NaN 时才重置计数器
