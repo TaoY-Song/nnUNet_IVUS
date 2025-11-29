@@ -58,7 +58,7 @@ class nnUNetDataLoader(DataLoader):
                 self.need_to_pad[d] += pad_sides[d]
         self.num_channels = None
         self.pad_sides = pad_sides
-        self.data_shape, self.seg_shape = self.determine_shapes()
+        self.data_shape_current, self.data_shape_previous, self.seg_shape = self.determine_shapes()
         self.sampling_probabilities = sampling_probabilities
         self.annotated_classes_key = tuple([-1] + label_manager.all_labels)
         self.has_ignore = label_manager.has_ignore_label
@@ -77,16 +77,19 @@ class nnUNetDataLoader(DataLoader):
         return np.random.uniform() < self.oversample_foreground_percent
 
     def determine_shapes(self):
-        # load one case
-        data, seg, seg_prev, properties = self._data.load_case(self._data.identifiers[0])
-        num_color_channels = data.shape[0]
+        # load one case - now returns 5 values
+        current_data, previous_data, seg, seg_prev, properties = self._data.load_case(self._data.identifiers[0])
+        num_color_channels = current_data.shape[0]  # current and previous have same number of channels
 
-        data_shape = (self.batch_size, num_color_channels, *self.patch_size)
+        # Create separate shapes for current and previous data
+        data_shape_current = (self.batch_size, num_color_channels, *self.patch_size)
+        data_shape_previous = (self.batch_size, num_color_channels, *self.patch_size)
+        
         channels_seg = seg.shape[0]
         if seg_prev is not None:
             channels_seg += 1
         seg_shape = (self.batch_size, channels_seg, *self.patch_size)
-        return data_shape, seg_shape
+        return data_shape_current, data_shape_previous, seg_shape
 
     def get_bbox(self, data_shape: np.ndarray, force_fg: bool, class_locations: Union[dict, None],
                  overwrite_class: Union[int, Tuple[int, ...]] = None, verbose: bool = False):
@@ -166,8 +169,9 @@ class nnUNetDataLoader(DataLoader):
 
     def generate_train_batch(self):
         selected_keys = self.get_indices()
-        # preallocate memory for data and seg
-        data_all = np.zeros(self.data_shape, dtype=np.float32)
+        # preallocate memory for current, previous, and seg
+        data_current_all = np.zeros(self.data_shape_current, dtype=np.float32)
+        data_previous_all = np.zeros(self.data_shape_previous, dtype=np.float32)
         seg_all = np.zeros(self.seg_shape, dtype=np.int16)
 
         for j, i in enumerate(selected_keys):
@@ -175,17 +179,19 @@ class nnUNetDataLoader(DataLoader):
             # (Lung for example)
             force_fg = self.get_do_oversample(j)
 
-            data, seg, seg_prev, properties = self._data.load_case(i)
+            # Load current and previous data separately (5 return values)
+            current_data, previous_data, seg, seg_prev, properties = self._data.load_case(i)
 
             # If we are doing the cascade then the segmentation from the previous stage will already have been loaded by
             # self._data.load_case(i) (see nnUNetDataset.load_case)
-            shape = data.shape[1:]
+            shape = current_data.shape[1:]  # spatial shape
 
             bbox_lbs, bbox_ubs = self.get_bbox(shape, force_fg, properties['class_locations'])
             bbox = [[i, j] for i, j in zip(bbox_lbs, bbox_ubs)]
 
-            # use ACVL utils for that. Cleaner.
-            data_all[j] = crop_and_pad_nd(data, bbox, 0)
+            # Crop current and previous data separately
+            data_current_all[j] = crop_and_pad_nd(current_data, bbox, 0)
+            data_previous_all[j] = crop_and_pad_nd(previous_data, bbox, 0)
 
             seg_cropped = crop_and_pad_nd(seg, bbox, -1)
             if seg_prev is not None:
@@ -193,29 +199,43 @@ class nnUNetDataLoader(DataLoader):
             seg_all[j] = seg_cropped
 
         if self.patch_size_was_2d:
-            data_all = data_all[:, :, 0]
+            data_current_all = data_current_all[:, :, 0]
+            data_previous_all = data_previous_all[:, :, 0]
             seg_all = seg_all[:, :, 0]
 
         if self.transforms is not None:
             with torch.no_grad():
                 with threadpool_limits(limits=1, user_api=None):
-                    data_all = torch.from_numpy(data_all).float()
+                    data_current_all = torch.from_numpy(data_current_all).float()
+                    data_previous_all = torch.from_numpy(data_previous_all).float()
                     seg_all = torch.from_numpy(seg_all).to(torch.int16)
-                    images = []
+                    
+                    images_current = []
+                    images_previous = []
                     segs = []
+                    
                     for b in range(self.batch_size):
-                        tmp = self.transforms(**{'image': data_all[b], 'segmentation': seg_all[b]})
-                        images.append(tmp['image'])
+                        # CRITICAL: Apply SAME transforms to current and previous to maintain spatial alignment
+                        # Concatenate temporally so they receive identical spatial augmentation
+                        combined = torch.cat([data_current_all[b], data_previous_all[b]], dim=0)
+                        tmp = self.transforms(**{'image': combined, 'segmentation': seg_all[b]})
+                        
+                        # Split back into current and previous after transformation
+                        num_channels = data_current_all[b].shape[0]
+                        images_current.append(tmp['image'][:num_channels])  # First half: current
+                        images_previous.append(tmp['image'][num_channels:])  # Second half: previous
                         segs.append(tmp['segmentation'])
-                    data_all = torch.stack(images)
+                    
+                    data_current_all = torch.stack(images_current)
+                    data_previous_all = torch.stack(images_previous)
                     if isinstance(segs[0], list):
                         seg_all = [torch.stack([s[i] for s in segs]) for i in range(len(segs[0]))]
                     else:
                         seg_all = torch.stack(segs)
-                    del segs, images
-            return {'data': data_all, 'target': seg_all, 'keys': selected_keys}
+                    del segs, images_current, images_previous
+            return {'data_current': data_current_all, 'data_previous': data_previous_all, 'target': seg_all, 'keys': selected_keys}
 
-        return {'data': data_all, 'target': seg_all, 'keys': selected_keys}
+        return {'data_current': data_current_all, 'data_previous': data_previous_all, 'target': seg_all, 'keys': selected_keys}
 
 
 if __name__ == '__main__':

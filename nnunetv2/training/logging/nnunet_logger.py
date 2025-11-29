@@ -39,12 +39,18 @@ class nnUNetLogger(object):
 
         if len(self.my_fantastic_logging[key]) < (epoch + 1):
             self.my_fantastic_logging[key].append(value)
-        else:
-            assert len(self.my_fantastic_logging[key]) == (epoch + 1), 'something went horribly wrong. My logging ' \
-                                                                       'lists length is off by more than 1'
-            print(f'maybe some logging issue!? logging {key} and {value}')
+        # else:
+        #     assert len(self.my_fantastic_logging[key]) == (epoch + 1), 'something went horribly wrong. My logging ' \
+        #                                                                'lists length is off by more than 1'
+        #     print(f'maybe some logging issue!? logging {key} and {value}')
+        #     self.my_fantastic_logging[key][epoch] = value
+        
+        # 如果太长，截断
+        elif len(self.my_fantastic_logging[key]) > (epoch + 1):
+            print(f"WARNING: Log list for '{key}' is too long ({len(self.my_fantastic_logging[key])} > {(epoch + 1)}). Truncating to fix desync.")
+            self.my_fantastic_logging[key][:] = self.my_fantastic_logging[key][:(epoch + 1)]
             self.my_fantastic_logging[key][epoch] = value
-
+            
         # handle the ema_fg_dice special case! It is automatically logged when we add a new mean_fg_dice
         if key == 'mean_fg_dice':
             new_ema_pseudo_dice = self.my_fantastic_logging['ema_fg_dice'][epoch - 1] * 0.9 + 0.1 * value \

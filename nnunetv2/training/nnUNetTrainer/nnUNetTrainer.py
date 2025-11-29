@@ -9,6 +9,7 @@ from datetime import datetime
 from time import time, sleep
 from typing import Tuple, Union, List
 
+import shutil
 import numpy as np
 import torch
 from batchgenerators.dataloading.multi_threaded_augmenter import MultiThreadedAugmenter
@@ -142,13 +143,13 @@ class nnUNetTrainer(object):
                 if self.is_cascaded else None
 
         ### Some hyperparameters for you to fiddle with
-        self.initial_lr = 1e-2
+        self.initial_lr = 1e-2   
         self.weight_decay = 3e-5
         self.oversample_foreground_percent = 0.33
         self.probabilistic_oversampling = False
-        self.num_iterations_per_epoch = 250
-        self.num_val_iterations_per_epoch = 50
-        self.num_epochs = 300
+        self.num_iterations_per_epoch = 150
+        self.num_val_iterations_per_epoch = 25
+        self.num_epochs = 600
         self.current_epoch = 0
         self.enable_deep_supervision = True
 
@@ -184,7 +185,7 @@ class nnUNetTrainer(object):
         # self.configure_rotation_dummyDA_mirroring_and_inital_patch_size and will be saved in checkpoints
 
         ### checkpoint saving stuff
-        self.save_every = 10
+        self.save_every = 5
         self.disable_checkpointing = False
 
         self.was_initialized = False
@@ -906,7 +907,11 @@ class nnUNetTrainer(object):
 
         self.print_plans()
         empty_cache(self.device)
-
+        
+        if not hasattr(self, 'nan_consecutive_count'):
+            self.nan_consecutive_count = 0
+            self.nan_threshold = 1  
+                
         # maybe unpack
         if self.local_rank == 0:
             self.dataset_class.unpack_dataset(
@@ -937,6 +942,24 @@ class nnUNetTrainer(object):
     def on_train_end(self):
         # dirty hack because on_epoch_end increments the epoch counter and this is executed afterwards.
         # This will lead to the wrong current epoch to be stored
+        
+        # [新增] 在最后进行NaN 检测和处理，防止最后几个epoch出问题
+        if self.nan_consecutive_count > 0:
+            print(f"NaN detected, current_epoch={self.current_epoch}", flush=True)                
+            self.print_to_log_file(f"NaN appeared at the last {self.nan_threshold} epoch")                
+            # 检查是否有健康备份
+            healthy_backup = join(self.output_folder, 'checkpoint_healthy_backup.pth')
+            final_checkpoint = join(self.output_folder, 'checkpoint_final.pth')
+            if os.path.isfile(healthy_backup):
+                # 复制备份          
+                shutil.copyfile(healthy_backup, final_checkpoint)
+                self.print_to_log_file("✅  Have healthy backup!")
+            else:
+                best_checkpoint_path = join(self.output_folder, 'checkpoint_best.pth')
+                shutil.copyfile(best_checkpoint_path, final_checkpoint)
+                self.print_to_log_file("⚠️  No healthy backup found! Restart from the best checkpoint")
+            exit(1)        
+            
         self.current_epoch -= 1
         self.save_checkpoint(join(self.output_folder, "checkpoint_final.pth"))
         self.current_epoch += 1
@@ -971,40 +994,37 @@ class nnUNetTrainer(object):
         self.logger.log('lrs', self.optimizer.param_groups[0]['lr'], self.current_epoch)
 
     def train_step(self, batch: dict) -> dict:
-        # [修改] 获取混合后的数据 (包含 current 和 previous)
-        input_combined = batch['data'].to(self.device, non_blocking=True)
+        # Get separated current and previous data from batch
+        data_current = batch['data_current'].to(self.device, non_blocking=True)
+        data_previous = batch['data_previous'].to(self.device, non_blocking=True)
         target = batch['target']
-        
-        # [新增] 数据切片：根据预处理时的拼接逻辑，将通道一分为二
-        # 假设预处理是 np.concatenate((current, prev), axis=0)
-        # input_combined shape: [Batch, Channels*2, X, Y, Z]
-        num_channels = input_combined.shape[1]
-        half_channels = num_channels // 2
-        
-        data = input_combined[:, :half_channels]      # 当前帧
-        previous_data = input_combined[:, half_channels:] # 前一帧
-
-        data = data.to(self.device, non_blocking=True)
-        previous_data = previous_data.to(self.device, non_blocking=True)
+        # print(f"data_current: {data_current.shape}")
+        # print(f"data_previous: {data_previous.shape}")
+                
         if isinstance(target, list):
             target = [i.to(self.device, non_blocking=True) for i in target]
+            # print(f"target[0] shape: {target[0].shape}")
         else:
             target = target.to(self.device, non_blocking=True)
-
+        
         self.optimizer.zero_grad(set_to_none=True)
         # Autocast can be annoying
         # If the device_type is 'cpu' then it's slow as heck and needs to be disabled.
         # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
         # So autocast will only be active if we have a cuda device.
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
-            # [修改] 网络接收两个输入
-            output = self.network(data, previous_data)
-            # del data
+            # Network receives two independent inputs (no channel concatenation)
+            output = self.network(data_current, data_previous)
+            # del data_current, data_previous
             l = self.loss(output, target)
             
-        # [修改] Check for NaN in loss
-        self.is_nan_train = torch.isnan(l).any()
+        # [修改] 检测当前 batch 的 loss 是否为 NaN
+        if not hasattr(self, 'has_nan_in_train_epoch'):
+            self.has_nan_in_train_epoch = False
         
+        if torch.isnan(l).any() or torch.isinf(l).any():
+            self.has_nan_in_train_epoch = True
+            
         if self.grad_scaler is not None:
             self.grad_scaler.scale(l).backward()
             self.grad_scaler.unscale_(self.optimizer)
@@ -1020,35 +1040,6 @@ class nnUNetTrainer(object):
     def on_train_epoch_end(self, train_outputs: List[dict]):
         outputs = collate_outputs(train_outputs)
                 
-        # [修改] 检查 train 和 val 中是否有 NaN
-        if hasattr(self, 'is_nan_train') and self.is_nan_train:
-            if not hasattr(self, 'nan_loss_count'):
-                self.nan_loss_count = 0
-            self.nan_loss_count += 1
-            print(f"loss count = {self.nan_loss_count}", flush=True)
-            
-            if (self.nan_loss_count + 1) == self.save_every:
-                print(f"NaN detected, current_epoch={self.current_epoch}", flush=True)
-                exit(1)
-        elif hasattr(self, 'is_nan_val') and self.is_nan_val:
-            if not hasattr(self, 'nan_loss_count'):
-                self.nan_loss_count = 0
-            self.nan_loss_count += 1
-            print(f"loss count = {self.nan_loss_count}", flush=True)
-            
-            if (self.nan_loss_count + 1) == self.save_every:
-                print(f"NaN detected, current_epoch={self.current_epoch}", flush=True)
-                exit(1)
-        else:
-            # 只有在 train 和 val 都没有 NaN 时才重置计数器
-            self.nan_loss_count = 0
-
-        # 重置当前 epoch 的 NaN 检测状态
-        if hasattr(self, 'is_nan_train'):
-            del self.is_nan_train
-        if hasattr(self, 'is_nan_val'):
-            del self.is_nan_val         
-            
         if self.is_ddp:
             losses_tr = [None for _ in range(dist.get_world_size())]
             dist.all_gather_object(losses_tr, outputs['loss'])
@@ -1062,17 +1053,10 @@ class nnUNetTrainer(object):
         self.network.eval()
 
     def validation_step(self, batch: dict) -> dict:
-        # [修改] 同样进行数据切片
-        input_combined = batch['data'].to(self.device, non_blocking=True)
-        num_channels = input_combined.shape[1]
-        half_channels = num_channels // 2
-        
-        data = input_combined[:, :half_channels]
-        previous_data = input_combined[:, half_channels:]
-        target = batch['target']
-
-        data = data.to(self.device, non_blocking=True)
-        previous_data = previous_data.to(self.device, non_blocking=True)       
+        # Get separated current and previous data from batch (same as train_step)
+        data_current = batch['data_current'].to(self.device, non_blocking=True)
+        data_previous = batch['data_previous'].to(self.device, non_blocking=True)
+        target = batch['target']       
         
         if isinstance(target, list):
             target = [i.to(self.device, non_blocking=True) for i in target]
@@ -1084,13 +1068,17 @@ class nnUNetTrainer(object):
         # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
         # So autocast will only be active if we have a cuda device.
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
-            # [修改] 网络接收两个输入
-            output = self.network(data, previous_data)
-            del data
+            # Network receives two independent inputs
+            output = self.network(data_current, data_previous)
+            del data_current, data_previous
             l = self.loss(output, target)
                        
-        # Check for NaN in loss
-        self.is_nan_val = torch.isnan(l).any()  
+        # [修改] 检测当前 batch 的 loss 是否为 NaN
+        if not hasattr(self, 'has_nan_in_val_epoch'):
+            self.has_nan_in_val_epoch = False
+        
+        if torch.isnan(l).any() or torch.isinf(l).any():
+            self.has_nan_in_val_epoch = True
         
         # we only need the output with the highest output resolution (if DS enabled)
         if self.enable_deep_supervision:
@@ -1185,12 +1173,51 @@ class nnUNetTrainer(object):
                                                self.logger.my_fantastic_logging['dice_per_class_or_region'][-1]])
         self.print_to_log_file(
             f"Epoch time: {np.round(self.logger.my_fantastic_logging['epoch_end_timestamps'][-1] - self.logger.my_fantastic_logging['epoch_start_timestamps'][-1], decimals=2)} s")
-
+        
+        # [新增] NaN 检测和处理
+        has_nan_this_epoch = (hasattr(self, 'has_nan_in_train_epoch') and self.has_nan_in_train_epoch) or \
+                            (hasattr(self, 'has_nan_in_val_epoch') and self.has_nan_in_val_epoch)
+        
+        if has_nan_this_epoch:
+            self.nan_consecutive_count += 1
+            self.print_to_log_file(f"⚠️  WARNING: NaN/Inf detected at epoch {self.current_epoch}! "
+                                f"(consecutive: {self.nan_consecutive_count}/{self.nan_threshold})")
+            
+            # 达到阈值：中断训练
+            if self.nan_consecutive_count >= self.nan_threshold:
+                print(f"NaN detected, current_epoch={self.current_epoch}", flush=True)                
+                self.print_to_log_file(f"NaN first appeared at: epoch {self.current_epoch - self.nan_consecutive_count + 1}")                
+                # 检查是否有健康备份
+                healthy_backup = join(self.output_folder, 'checkpoint_healthy_backup.pth')
+                final_checkpoint = join(self.output_folder, 'checkpoint_final.pth')
+                if os.path.isfile(healthy_backup):
+                    # 复制备份          
+                    shutil.copyfile(healthy_backup, final_checkpoint)
+                    self.print_to_log_file("✅  Have healthy backup!")
+                else:
+                    best_checkpoint_path = join(self.output_folder, 'checkpoint_best.pth')
+                    shutil.copyfile(best_checkpoint_path, final_checkpoint)
+                    self.print_to_log_file("⚠️  No healthy backup found! Restart from the best checkpoint")
+                exit(1)
+        else:
+            # 正常epoch，重置计数
+            if self.nan_consecutive_count > 0:
+                self.print_to_log_file(f"✅ NaN resolved after {self.nan_consecutive_count} bad epochs")
+            self.nan_consecutive_count = 0
+        
+        # 清除本epoch的NaN标记
+        if hasattr(self, 'has_nan_in_train_epoch'):
+            del self.has_nan_in_train_epoch
+        if hasattr(self, 'has_nan_in_val_epoch'):
+            del self.has_nan_in_val_epoch
+            
         # handling periodic checkpointing
         current_epoch = self.current_epoch
         if (current_epoch + 1) % self.save_every == 0 and current_epoch != (self.num_epochs - 1):
-            self.save_checkpoint(join(self.output_folder, 'checkpoint_latest.pth'))
-
+            self.save_checkpoint(join(self.output_folder, 'checkpoint_latest.pth'))            
+            if not hasattr(self, 'nan_consecutive_count') or self.nan_consecutive_count == 0:
+                    self.save_checkpoint(join(self.output_folder, 'checkpoint_healthy_backup.pth'))
+                
         # handle 'best' checkpointing. ema_fg_dice is computed by the logger and can be accessed like this
         if self._best_ema is None or self.logger.my_fantastic_logging['ema_fg_dice'][-1] > self._best_ema:
             self._best_ema = self.logger.my_fantastic_logging['ema_fg_dice'][-1]
@@ -1320,24 +1347,33 @@ class nnUNetTrainer(object):
                                                                allowed_num_queued=2)
 
                 self.print_to_log_file(f"predicting {k}")
-                data, _, seg_prev, properties = dataset_val.load_case(k)
+                data, previous_data, _, seg_prev, properties = dataset_val.load_case(k)
 
                 # we do [:] to convert blosc2 to numpy
                 data = data[:]
+                previous_data = previous_data[:]
 
+                # Cascade processing (only for current frame)
+                # Note: This project does not use 3D cascaded networks. This code is retained for
+                # framework compatibility. Cascade segmentation is only added to current data because
+                # previous frame serves as temporal context only, not as a target for prediction.
                 if self.is_cascaded:
                     seg_prev = seg_prev[:]
                     data = np.vstack((data, convert_labelmap_to_one_hot(seg_prev, self.label_manager.foreground_labels,
                                                                         output_dtype=data.dtype)))
+                
+                # Convert both to tensors
                 with warnings.catch_warnings():
                     # ignore 'The given NumPy array is not writable' warning
                     warnings.simplefilter("ignore")
                     data = torch.from_numpy(data)
+                    previous_data = torch.from_numpy(previous_data)
 
-                self.print_to_log_file(f'{k}, shape {data.shape}, rank {self.local_rank}')
+                self.print_to_log_file(f'{k}, data shape {data.shape}, previous shape {previous_data.shape}, rank {self.local_rank}')
                 output_filename_truncated = join(validation_output_folder, k)
 
-                prediction = predictor.predict_sliding_window_return_logits(data)
+                # Pass both tensors to predictor
+                prediction = predictor.predict_sliding_window_return_logits(data, previous_data)
                 prediction = prediction.cpu()
 
                 # this needs to go into background processes
@@ -1365,7 +1401,7 @@ class nnUNetTrainer(object):
                         try:
                             # we do this so that we can use load_case and do not have to hard code how loading training cases is implemented
                             tmp = dataset_class(expected_preprocessed_folder, [k])
-                            d, _, _, _ = tmp.load_case(k)
+                            d, _, _, _, _ = tmp.load_case(k)
                         except FileNotFoundError:
                             self.print_to_log_file(
                                 f"Predicting next stage {n} failed for case {k} because the preprocessed file is missing! "

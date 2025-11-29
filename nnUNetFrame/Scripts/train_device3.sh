@@ -9,14 +9,14 @@ UNET_CONFIGURATION="2d"
 # 3d_fullres：在高图像分辨率上运行的 3D U-Net（仅适用于 3D 数据集）
 # 3d_lowres → 3d_cascade_fullres：3D U-Net 级联
 FLAG_DIR="/data/taoyusong/nnUNet_IVUS/nnUNet/nnUNetFrame/DATASET/nnUNet_results/Flag_${DATASET_ID}"
-MAX_C_RETRIES=10  # **最大重试次数**
+MAX_C_RETRIES=100  # **最大重试次数**
 # ===================================================
 
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=3
 
 mkdir -p "$FLAG_DIR"
 
-for f in 1; do
+for f in 3 4; do
     if [ -f "${FLAG_DIR}/fold_${f}_completed" ]; then
         echo -e "\n\033[1;42m\033[97m  ===>>> FOLD $f 已经训练完成，跳过 ===>>>  \033[0m\n"
         continue
@@ -24,18 +24,18 @@ for f in 1; do
 
     c_retry_count=0
     use_c_mode=false
-
+    
     echo -e "\n\033[1;44m\033[97m  ===>>>  开始训练 Fold $f  ===>>>  \033[0m\n"
 
     while true; do
         LOG_FILE="${FLAG_DIR}/temp_log_fold_${f}.txt"
 
         if [ "$use_c_mode" = true ]; then
-            echo -e "\033[1;47m\033[97m  >>> 使用 --c 模式继续（第 $((c_retry_count))/$MAX_C_RETRIES 次）<<<\033[0m"
+            echo -e "\033[1;47m\033[34m  >>> 使用 --c 模式继续（第 $((c_retry_count))/$MAX_C_RETRIES 次）<<<\033[0m"
             nnUNetv2_train "$DATASET_ID" "$UNET_CONFIGURATION" "$f" --c 2>&1 | tee "$LOG_FILE"
         else
             echo -e "\033[1;47m\033[34m  >>> 重启训练 <<<\033[0m"
-            nnUNetv2_train "$DATASET_ID" "$UNET_CONFIGURATION" "$f" 2>&1 | tee "$LOG_FILE"
+            nnUNetv2_train "$DATASET_ID" "$UNET_CONFIGURATION" "$f"  2>&1 | tee "$LOG_FILE"
         fi
 
         exit_code=${PIPESTATUS[0]}

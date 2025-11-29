@@ -14,9 +14,7 @@
 
 import math
 import multiprocessing
-### [新增] 引入 Manager 用于进程间通信，引入 re 用于解析文件名
-from multiprocessing.managers import SyncManager
-import re
+import re  # Needed for pattern matching in grouping logic
 import shutil
 from time import sleep
 from typing import Tuple, List, Union # added List
@@ -32,6 +30,8 @@ import nnunetv2
 from nnunetv2.paths import nnUNet_preprocessed, nnUNet_raw
 from nnunetv2.preprocessing.cropping.cropping import crop_to_nonzero
 from nnunetv2.preprocessing.resampling.default_resampling import compute_new_shape
+# Import shared temporal grouping utility
+from nnunetv2.preprocessing.preprocessors.temporal_utils import group_temporal_identifiers
 from nnunetv2.training.dataloading.nnunet_dataset import nnUNetDatasetBlosc2
 from nnunetv2.utilities.dataset_name_id_conversion import maybe_convert_to_dataset_name
 from nnunetv2.utilities.find_class_by_name import recursive_find_python_class
@@ -151,28 +151,65 @@ class DefaultPreprocessor(object):
                                       dataset_json)
         return data, seg, data_properties
 
-    ### [修改] 增加了 results 参数，去掉了直接保存的逻辑
     def run_case_save(self, output_filename_truncated: str, image_files: List[str], seg_file: str,
                       plans_manager: PlansManager, configuration_manager: ConfigurationManager,
-                      dataset_json: Union[dict, str], results: list):
+                      dataset_json: Union[dict, str], dataset: dict, temporal_mapping: dict):
+        """
+        Preprocess and save a single case with its previous frame.
         
-        # 执行标准的 run_case 预处理
-        data, seg, properties = self.run_case(image_files, seg_file, plans_manager, configuration_manager, dataset_json)
+        Args:
+            output_filename_truncated: Output file path (without extension)
+            image_files: List of image file paths for current frame
+            seg_file: Segmentation file path
+            plans_manager: Plans manager instance
+            configuration_manager: Configuration manager instance
+            dataset_json: Dataset JSON dict or path
+            dataset: Full dataset dict for looking up previous case files
+            temporal_mapping: Dict mapping case_id to previous_case_id
+        """
+        import os
         
-        # 转换数据类型优化内存
+        # 1. Preprocess current frame
+        data, seg, properties = self.run_case(image_files, seg_file, 
+                                              plans_manager, configuration_manager, dataset_json)
+        
+        # 2. Find and preprocess previous frame
+        case_id = os.path.basename(output_filename_truncated)
+        previous_case_id = temporal_mapping.get(case_id, case_id)  # Fallback to self if not found
+        
+        if previous_case_id in dataset:
+            previous_image_files = dataset[previous_case_id]['images']
+            # Preprocess previous frame (no segmentation needed)
+            previous_data, _, _ = self.run_case(previous_image_files, None,
+                                                plans_manager, configuration_manager, dataset_json)
+        else:
+            # Fallback: use current as previous (first frame behavior)
+            previous_data = data.copy()
+        
+        # 3. Convert dtypes for storage
         data = data.astype(np.float32, copy=False)
         seg = seg.astype(np.int16, copy=False)
+        previous_data = previous_data.astype(np.float32, copy=False)
+               
+        # 4. Compute blosc2 compression parameters for all 3 arrays
+        block_size_data, chunk_size_data = nnUNetDatasetBlosc2.comp_blosc2_params(
+            data.shape,
+            tuple(configuration_manager.patch_size),
+            data.itemsize)
+        block_size_seg, chunk_size_seg = nnUNetDatasetBlosc2.comp_blosc2_params(
+            seg.shape,
+            tuple(configuration_manager.patch_size),
+            seg.itemsize)
+        block_size_previous, chunk_size_previous = nnUNetDatasetBlosc2.comp_blosc2_params(
+            previous_data.shape,
+            tuple(configuration_manager.patch_size),
+            previous_data.itemsize)
         
-        ### [修改] 原代码直接计算 block size 并保存为 b2nd 文件。
-        ### 现在改为：将数据存入 results 列表，回传给主进程进行时序拼接。
-        ### 注意：这里不再计算 blosc2 参数，因为拼接后 data shape 会变，需要保存时重新计算。
-        
-        results.append({
-            'filename': output_filename_truncated,
-            'data': data,
-            'seg': seg,
-            'data_properties': properties
-        })
+        # 5. Save 3 independent files: current.b2nd, seg.b2nd, previous.b2nd
+        nnUNetDatasetBlosc2.save_case(data, previous_data, seg, properties, output_filename_truncated,
+                                        chunks=chunk_size_data, blocks=block_size_data,
+                                        chunks_seg=chunk_size_seg, blocks_seg=block_size_seg, chunks_previous=chunk_size_previous,
+                                        blocks_previous=block_size_previous)    
 
     @staticmethod
     def _sample_foreground_locations(seg: np.ndarray, classes_or_regions: Union[List[int], List[Tuple[int, ...]]],
@@ -279,15 +316,11 @@ class DefaultPreprocessor(object):
 
         dataset = get_filenames_of_train_images_and_targets(join(nnUNet_raw, dataset_name), dataset_json)
         
-        # identifiers = [os.path.basename(i[:-len(dataset_json['file_ending'])]) for i in seg_fnames]
-        # output_filenames_truncated = [join(output_directory, i) for i in identifiers]
+        # [New] Pre-calculate temporal mapping using shared temporal_utils
+        from nnunetv2.preprocessing.preprocessors.temporal_utils import create_temporal_mapping_for_dataset
+        temporal_mapping = create_temporal_mapping_for_dataset(dataset, verbose=self.verbose)
 
-        ### [新增] 初始化 SyncManager 用于收集所有子进程处理好的结果到内存中
-        manager = SyncManager()
-        manager.start()
-        results = manager.list()  # 共享列表
-
-        # multiprocessing magic.
+        # Standard multiprocessing flow (restored from original nnUNet)
         r = []
         with multiprocessing.get_context("spawn").Pool(num_processes) as p:
             remaining = list(range(len(dataset)))
@@ -295,11 +328,10 @@ class DefaultPreprocessor(object):
             # So we need to store the original pool of workers.
             workers = [j for j in p._pool]
             for k in dataset.keys():
-                ### [修改] 传入 results 参数
                 r.append(p.starmap_async(self.run_case_save,
                                          ((join(output_directory, k), dataset[k]['images'], dataset[k]['label'],
                                            plans_manager, configuration_manager,
-                                           dataset_json, results),)))
+                                           dataset_json, dataset, temporal_mapping),)))
 
             with tqdm(desc=None, total=len(dataset), disable=self.verbose) as pbar:
                 while len(remaining) > 0:
@@ -320,102 +352,6 @@ class DefaultPreprocessor(object):
                         pbar.update()
                     remaining = [i for i in remaining if i not in done]
                     sleep(0.1)
-        
-        ### [新增] 以下是全部预处理完成后，在主进程进行时序数据匹配、拼接和保存的逻辑
-        print("-" * 50)
-        print("Preprocessing finished in memory. Starting temporal grouping and saving...")
-        # print(f"Total cases: {len(results)}")
-        print("-" * 50)
-
-        # 将共享列表转为普通列表
-        final_results = list(results)
-
-        # 1. 分组逻辑 (ID_Frame)
-        grouped_files = {}
-        # 匹配模式: 任意字符 + 下划线 + 数字结尾 (例如: Patient123_0000)
-        pattern = re.compile(r'(.*)_(\d+)$')
-
-        for result in final_results:
-            # result['filename'] 是完整的输出路径，例如 /path/to/output/Dataset001/Patient123_0000
-            # 我们只取 basename 来正则匹配
-            full_path = result['filename']
-            fname = os.path.basename(full_path)
-            
-            match = pattern.match(fname)
-            if match:
-                prefix = match.group(1)    # ID (e.g. Patient123)
-                time_index = int(match.group(2)) # Frame (e.g. 0)
-                if prefix not in grouped_files:
-                    grouped_files[prefix] = []
-                grouped_files[prefix].append((time_index, result))
-            else:
-                # 如果不符合 ID_Frame 格式，作为一个单独的组处理
-                print(f"Warning: Filename {fname} does not match format ID_Frame. Processing independently.")
-                if fname not in grouped_files:
-                    grouped_files[fname] = []
-                grouped_files[fname].append((0, result))
-
-        # 2. 排序与保存
-        for prefix in tqdm(grouped_files.keys(), desc="Saving Temporal Groups"):
-            # 按时间索引排序
-            grouped_files[prefix].sort(key=lambda x: x[0])
-            
-            file_group = grouped_files[prefix]
-            for i, (time_index, result) in enumerate(file_group):
-                output_filename = result['filename'] # 这是基础文件名
-                
-                current_data = result['data']
-                current_seg = result['seg']
-                current_properties = result['data_properties']
-
-                # 获取前一帧数据
-                if i == 0:
-                    # 第一帧，前一帧数据 = 当前帧数据
-                    previous_data = current_data
-                    previous_properties = current_properties
-                else:
-                    # 非第一帧，获取上一帧
-                    previous_data = file_group[i - 1][1]['data']
-                    previous_properties = file_group[i - 1][1]['data_properties']
-
-                # --- 保存方法 1: .npz (你的旧代码兼容格式) ---
-                # 保存为 current_data 和 previous_data 分开的 key
-                # np.savez_compressed(output_filename + '.npz',
-                #                     current_data=current_data,
-                #                     current_seg=current_seg,
-                #                     previous_data=previous_data)
-
-                # --- 保存方法 2: .b2nd (nnUNet v2 标准格式) ---
-                # [关键点] nnUNetDatasetBlosc2 只能保存一个 data 数组。
-                # 为了利用 nnUNet v2 训练，我们需要将 Current 和 Previous 在通道维度 (axis 0) 拼接。
-                # 假设原数据是 (C, D, H, W)，拼接后变为 (2C, D, H, W)。
-                # 你需要在 dataset.json 或 plans 中调整 channel 设置。
-                
-                combined_data = np.concatenate((current_data, previous_data), axis=0)
-                
-                # 重新计算 Blosc2 参数 (因为数据 shape 变了)
-                block_size_data, chunk_size_data = nnUNetDatasetBlosc2.comp_blosc2_params(
-                    combined_data.shape,
-                    tuple(configuration_manager.patch_size),
-                    combined_data.itemsize)
-                block_size_seg, chunk_size_seg = nnUNetDatasetBlosc2.comp_blosc2_params(
-                    current_seg.shape,
-                    tuple(configuration_manager.patch_size),
-                    current_seg.itemsize)
-                
-                # 合并 properties (保存到 pkl 中)
-                # 复制 current properties，并添加 previous frame info
-                combined_properties = current_properties.copy()
-                combined_properties['previous_frame_properties'] = previous_properties
-                
-                # 调用 nnUNet v2 标准保存函数 (它会自动保存 .pkl)
-                nnUNetDatasetBlosc2.save_case(combined_data, current_seg, combined_properties, output_filename,
-                                              chunks=chunk_size_data, blocks=block_size_data,
-                                              chunks_seg=chunk_size_seg, blocks_seg=block_size_seg)
-
-        # 停止 Manager
-        manager.shutdown()
-        print("Done.")
 
 
     def modify_seg_fn(self, seg: np.ndarray, plans_manager: PlansManager, dataset_json: dict,

@@ -128,3 +128,8 @@ ENV/
 
 # 允许追踪 nnUNetFrame/DATASET/nnUNet_raw/ 下的 JSON
 !nnUNetFrame/DATASET/nnUNet_raw/**/*.json
+nnUNetFrame/DATASET/nnUNet_results/Flag_*
+nnUNetFrame/DATASET/nnUNet_results/IVUS_copy
+nnUNetFrame/DATASET/nnUNet_preprocessed/IVUS_间断帧预处理结果
+nnUNetFrame/DATASET/nnUNet_preprocessed/IVUS_连续帧预处理结果
+nnUNetFrame/DATASET/nnUNet_inference/**

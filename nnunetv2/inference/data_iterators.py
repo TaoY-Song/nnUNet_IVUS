@@ -15,6 +15,7 @@ from nnunetv2.utilities.plans_handling.plans_handler import PlansManager, Config
 
 
 def preprocess_fromfiles_save_to_queue(list_of_lists: List[List[str]],
+                                       list_of_previous_lists: List[List[str]],
                                        list_of_segs_from_prev_stage_files: Union[None, List[str]],
                                        output_filenames_truncated: Union[None, List[str]],
                                        plans_manager: PlansManager,
@@ -28,19 +29,35 @@ def preprocess_fromfiles_save_to_queue(list_of_lists: List[List[str]],
         label_manager = plans_manager.get_label_manager(dataset_json)
         preprocessor = configuration_manager.preprocessor_class(verbose=verbose)
         for idx in range(len(list_of_lists)):
+            # Preprocess current frame
             data, seg, data_properties = preprocessor.run_case(list_of_lists[idx],
                                                                list_of_segs_from_prev_stage_files[
                                                                    idx] if list_of_segs_from_prev_stage_files is not None else None,
                                                                plans_manager,
                                                                configuration_manager,
                                                                dataset_json)
+            
+            # Preprocess previous frame (no seg needed for previous)
+            previous_data, _, previous_properties = preprocessor.run_case(list_of_previous_lists[idx],
+                                                                         None,
+                                                                         plans_manager,
+                                                                         configuration_manager,
+                                                                         dataset_json)
+            
+            # Cascade processing (only for current frame)
+            # Note: This project does not use 3D cascaded networks, but this code is kept
+            # for compatibility with the nnUNet framework. If cascade is enabled, the
+            # segmentation from the previous stage is stacked onto the current data only,
+            # as the previous frame serves purely as temporal context.
             if list_of_segs_from_prev_stage_files is not None and list_of_segs_from_prev_stage_files[idx] is not None:
                 seg_onehot = convert_labelmap_to_one_hot(seg[0], label_manager.foreground_labels, data.dtype)
                 data = np.vstack((data, seg_onehot))
 
+            # Convert to tensors
             data = torch.from_numpy(data).to(dtype=torch.float32, memory_format=torch.contiguous_format)
+            previous_data = torch.from_numpy(previous_data).to(dtype=torch.float32, memory_format=torch.contiguous_format)
 
-            item = {'data': data, 'data_properties': data_properties,
+            item = {'data': data, 'previous_data': previous_data, 'data_properties': data_properties,
                     'ofile': output_filenames_truncated[idx] if output_filenames_truncated is not None else None}
             success = False
             while not success:
@@ -59,6 +76,7 @@ def preprocess_fromfiles_save_to_queue(list_of_lists: List[List[str]],
 
 
 def preprocessing_iterator_fromfiles(list_of_lists: List[List[str]],
+                                     list_of_previous_lists: List[List[str]],
                                      list_of_segs_from_prev_stage_files: Union[None, List[str]],
                                      output_filenames_truncated: Union[None, List[str]],
                                      plans_manager: PlansManager,
@@ -81,6 +99,7 @@ def preprocessing_iterator_fromfiles(list_of_lists: List[List[str]],
         pr = context.Process(target=preprocess_fromfiles_save_to_queue,
                      args=(
                          list_of_lists[i::num_processes],
+                         list_of_previous_lists[i::num_processes],
                          list_of_segs_from_prev_stage_files[
                          i::num_processes] if list_of_segs_from_prev_stage_files is not None else None,
                          output_filenames_truncated[

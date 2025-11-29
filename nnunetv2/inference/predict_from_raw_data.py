@@ -274,7 +274,16 @@ class nnUNetPredictor(object):
                                                             seg_from_prev_stage_files: Union[List[str], None],
                                                             output_filenames_truncated: Union[List[str], None],
                                                             num_processes: int):
-        return preprocessing_iterator_fromfiles(input_list_of_lists, seg_from_prev_stage_files,
+        # Use temporal_utils to get previous frame file lists
+        from nnunetv2.preprocessing.preprocessors.temporal_utils import group_temporal_files
+        previous_file_mapping = group_temporal_files(input_list_of_lists, identifiers=None, verbose=self.verbose)
+        
+        # Build previous frame file lists (index-aligned with input_list_of_lists)
+        previous_list_of_lists = [previous_file_mapping[idx] for idx in range(len(input_list_of_lists))]
+        
+        # Pass both current and previous frame lists to preprocessing iterator
+        return preprocessing_iterator_fromfiles(input_list_of_lists, previous_list_of_lists,
+                                                seg_from_prev_stage_files,
                                                 output_filenames_truncated, self.plans_manager, self.dataset_json,
                                                 self.configuration_manager, num_processes, self.device.type == 'cuda',
                                                 self.verbose_preprocessing)
@@ -366,6 +375,17 @@ class nnUNetPredictor(object):
                     delfile = data
                     data = torch.from_numpy(np.load(data))
                     os.remove(delfile)
+                
+                # Extract previous frame data
+                previous_data = preprocessed.get('previous_data', None)
+                if previous_data is not None:
+                    if isinstance(previous_data, str):
+                        delfile_prev = previous_data
+                        previous_data = torch.from_numpy(np.load(previous_data))
+                        os.remove(delfile_prev)
+                else:
+                    # Fallback: if no previous_data, use current frame as previous (first frame case)
+                    previous_data = data
 
                 ofile = preprocessed['ofile']
                 if ofile is not None:
@@ -385,7 +405,7 @@ class nnUNetPredictor(object):
                     proceed = not check_workers_alive_and_busy(export_pool, worker_list, r, allowed_num_queued=2)
 
                 # convert to numpy to prevent uncatchable memory alignment errors from multiprocessing serialization of torch tensors
-                prediction = self.predict_logits_from_preprocessed_data(data).cpu().detach().numpy()
+                prediction = self.predict_logits_from_preprocessed_data(data, previous_data).cpu().detach().numpy()
 
                 if ofile is not None:
                     print('sending off prediction to background worker for resampling and export')
@@ -470,10 +490,14 @@ class nnUNetPredictor(object):
                 return ret
 
     @torch.inference_mode()
-    def predict_logits_from_preprocessed_data(self, data: torch.Tensor) -> torch.Tensor:
+    def predict_logits_from_preprocessed_data(self, data: torch.Tensor, previous_data: torch.Tensor) -> torch.Tensor:
         """
         IMPORTANT! IF YOU ARE RUNNING THE CASCADE, THE SEGMENTATION FROM THE PREVIOUS STAGE MUST ALREADY BE STACKED ON
         TOP OF THE IMAGE AS ONE-HOT REPRESENTATION! SEE PreprocessAdapter ON HOW THIS SHOULD BE DONE!
+
+        Args:
+            data: Current frame data tensor, shape (c, x, y(, z))
+            previous_data: Previous frame data tensor, shape (c, x, y(, z))
 
         RETURNED LOGITS HAVE THE SHAPE OF THE INPUT. THEY MUST BE CONVERTED BACK TO THE ORIGINAL IMAGE SIZE.
         SEE convert_predicted_logits_to_segmentation_with_correct_shape
@@ -494,9 +518,9 @@ class nnUNetPredictor(object):
             # second iteration to crash due to OOM. Grabbing that with try except cause way more bloated code than
             # this actually saves computation time
             if prediction is None:
-                prediction = self.predict_sliding_window_return_logits(data).to('cpu')
+                prediction = self.predict_sliding_window_return_logits(data, previous_data).to('cpu')
             else:
-                prediction += self.predict_sliding_window_return_logits(data).to('cpu')
+                prediction += self.predict_sliding_window_return_logits(data, previous_data).to('cpu')
 
         if len(self.list_of_parameters) > 1:
             prediction /= len(self.list_of_parameters)
@@ -540,37 +564,52 @@ class nnUNetPredictor(object):
         return slicers
 
     @torch.inference_mode()
-    def _internal_maybe_mirror_and_predict(self, x: torch.Tensor) -> torch.Tensor:
+    def _internal_maybe_mirror_and_predict(self, x_current: torch.Tensor, x_previous: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x_current: Current frame patch, shape (1, c, x, y(, z))
+            x_previous: Previous frame patch, shape (1, c, x, y(, z))
+        
+        Returns:
+            prediction: Network output
+        """
         mirror_axes = self.allowed_mirroring_axes if self.use_mirroring else None
-        x_previous = x
-        prediction = self.network(x, x_previous)
+        
+        # Use the separate current and previous frames directly (no channel splitting needed)
+        # Normal forward pass
+        prediction = self.network(x_current, x_previous)
 
         if mirror_axes is not None:
             # check for invalid numbers in mirror_axes
             # x should be 5d for 3d images and 4d for 2d. so the max value of mirror_axes cannot exceed len(x.shape) - 3
-            assert max(mirror_axes) <= x.ndim - 3, 'mirror_axes does not match the dimension of the input!'
+            assert max(mirror_axes) <= x_current.ndim - 3, 'mirror_axes does not match the dimension of the input!'
 
             mirror_axes = [m + 2 for m in mirror_axes]
             axes_combinations = [
                 c for i in range(len(mirror_axes)) for c in itertools.combinations(mirror_axes, i + 1)
             ]
             for axes in axes_combinations:
-                prediction += torch.flip(self.network(torch.flip(x, axes)), axes)
+                # Mirror both current and previous frames along the same axes
+                prediction += torch.flip(self.network(torch.flip(x_current, axes), torch.flip(x_previous, axes)), axes)
             prediction /= (len(axes_combinations) + 1)
         return prediction
 
     @torch.inference_mode()
     def _internal_predict_sliding_window_return_logits(self,
                                                        data: torch.Tensor,
+                                                       previous_data: torch.Tensor,
                                                        slicers,
                                                        do_on_device: bool = True,
                                                        ):
-        predicted_logits = n_predictions = prediction = gaussian = workon = None
+        predicted_logits = n_predictions = prediction = gaussian = workon = workon_prev = None
         results_device = self.device if do_on_device else torch.device('cpu')
 
-        def producer(d, slh, q):
+        def producer(d, d_prev, slh, q):
             for s in slh:
-                q.put((torch.clone(d[s][None], memory_format=torch.contiguous_format).to(self.device), s))
+                # Extract matching patches from both current and previous frames
+                current_patch = torch.clone(d[s][None], memory_format=torch.contiguous_format).to(self.device)
+                previous_patch = torch.clone(d_prev[s][None], memory_format=torch.contiguous_format).to(self.device)
+                q.put((current_patch, previous_patch, s))
             q.put('end')
 
         try:
@@ -578,10 +617,11 @@ class nnUNetPredictor(object):
 
             # move data to device
             if self.verbose:
-                print(f'move image to device {results_device}')
+                print(f'move images to device {results_device}')
             data = data.to(results_device)
+            previous_data = previous_data.to(results_device)
             queue = Queue(maxsize=2)
-            t = Thread(target=producer, args=(data, slicers, queue))
+            t = Thread(target=producer, args=(data, previous_data, slicers, queue))
             t.start()
 
             # preallocate arrays
@@ -608,8 +648,8 @@ class nnUNetPredictor(object):
                     if item == 'end':
                         queue.task_done()
                         break
-                    workon, sl = item
-                    prediction = self._internal_maybe_mirror_and_predict(workon)[0].to(results_device)
+                    workon, workon_prev, sl = item
+                    prediction = self._internal_maybe_mirror_and_predict(workon, workon_prev)[0].to(results_device)
 
                     if self.use_gaussian:
                         prediction *= gaussian
@@ -627,16 +667,22 @@ class nnUNetPredictor(object):
                                    'reduce value_scaling_factor in compute_gaussian or increase the dtype of '
                                    'predicted_logits to fp32')
         except Exception as e:
-            del predicted_logits, n_predictions, prediction, gaussian, workon
+            del predicted_logits, n_predictions, prediction, gaussian, workon, workon_prev
             empty_cache(self.device)
             empty_cache(results_device)
             raise e
         return predicted_logits
 
     @torch.inference_mode()
-    def predict_sliding_window_return_logits(self, input_image: torch.Tensor) \
+    def predict_sliding_window_return_logits(self, input_image: torch.Tensor, previous_image: torch.Tensor) \
             -> Union[np.ndarray, torch.Tensor]:
+        """
+        Args:
+            input_image: Current frame tensor, shape (c, x, y, z) for 3D or (c, x, y) for 2D
+            previous_image: Previous frame tensor, same shape as input_image
+        """
         assert isinstance(input_image, torch.Tensor)
+        assert isinstance(previous_image, torch.Tensor)
         self.network = self.network.to(self.device)
         self.network.eval()
 
@@ -650,31 +696,37 @@ class nnUNetPredictor(object):
         # So autocast will only be active if we have a cuda device.
         with torch.autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
             assert input_image.ndim == 4, 'input_image must be a 4D np.ndarray or torch.Tensor (c, x, y, z)'
+            assert previous_image.ndim == 4, 'previous_image must be a 4D torch.Tensor (c, x, y, z)'
 
             if self.verbose:
-                print(f'Input shape: {input_image.shape}')
+                print(f'Current frame shape: {input_image.shape}')
+                print(f'Previous frame shape: {previous_image.shape}')
                 print("step_size:", self.tile_step_size)
                 print("mirror_axes:", self.allowed_mirroring_axes if self.use_mirroring else None)
 
             # if input_image is smaller than tile_size we need to pad it to tile_size.
+            # Pad both current and previous frames identically
             data, slicer_revert_padding = pad_nd_image(input_image, self.configuration_manager.patch_size,
                                                        'constant', {'value': 0}, True,
                                                        None)
+            previous_data, _ = pad_nd_image(previous_image, self.configuration_manager.patch_size,
+                                           'constant', {'value': 0}, True,
+                                           None)
 
             slicers = self._internal_get_sliding_window_slicers(data.shape[1:])
 
             if self.perform_everything_on_device and self.device != 'cpu':
                 # we need to try except here because we can run OOM in which case we need to fall back to CPU as a results device
                 try:
-                    predicted_logits = self._internal_predict_sliding_window_return_logits(data, slicers,
+                    predicted_logits = self._internal_predict_sliding_window_return_logits(data, previous_data, slicers,
                                                                                            self.perform_everything_on_device)
                 except RuntimeError:
                     print(
                         'Prediction on device was unsuccessful, probably due to a lack of memory. Moving results arrays to CPU')
                     empty_cache(self.device)
-                    predicted_logits = self._internal_predict_sliding_window_return_logits(data, slicers, False)
+                    predicted_logits = self._internal_predict_sliding_window_return_logits(data, previous_data, slicers, False)
             else:
-                predicted_logits = self._internal_predict_sliding_window_return_logits(data, slicers,
+                predicted_logits = self._internal_predict_sliding_window_return_logits(data, previous_data, slicers,
                                                                                        self.perform_everything_on_device)
 
             empty_cache(self.device)
@@ -734,14 +786,19 @@ class nnUNetPredictor(object):
 
         label_manager = self.plans_manager.get_label_manager(self.dataset_json)
         preprocessor = self.configuration_manager.preprocessor_class(verbose=self.verbose)
+        
+        # Create temporal mapping to get previous frame file lists
+        from nnunetv2.preprocessing.preprocessors.temporal_utils import group_temporal_files
+        previous_file_mapping = group_temporal_files(list_of_lists_or_source_folder, verbose=self.verbose)
 
         if output_filename_truncated is None:
             output_filename_truncated = [None] * len(list_of_lists_or_source_folder)
         if seg_from_prev_stage_files is None:
-            seg_from_prev_stage_files = [None] * len(seg_from_prev_stage_files)
+            seg_from_prev_stage_files = [None] * len(list_of_lists_or_source_folder)
 
         ret = []
-        for li, of, sps in zip(list_of_lists_or_source_folder, output_filename_truncated, seg_from_prev_stage_files):
+        for idx, (li, of, sps) in enumerate(zip(list_of_lists_or_source_folder, output_filename_truncated, seg_from_prev_stage_files)):
+            # Preprocess current frame
             data, seg, data_properties = preprocessor.run_case(
                 li,
                 sps,
@@ -749,10 +806,21 @@ class nnUNetPredictor(object):
                 self.configuration_manager,
                 self.dataset_json
             )
+            
+            # Get and preprocess previous frame
+            prev_li = previous_file_mapping[idx]
+            previous_data, _, _ = preprocessor.run_case(
+                prev_li,
+                None,  # No segmentation from previous stage for previous frame
+                self.plans_manager,
+                self.configuration_manager,
+                self.dataset_json
+            )
 
             print(f'perform_everything_on_device: {self.perform_everything_on_device}')
 
-            prediction = self.predict_logits_from_preprocessed_data(torch.from_numpy(data)).cpu()
+            # Pass both current and previous frames to prediction
+            prediction = self.predict_logits_from_preprocessed_data(torch.from_numpy(data), torch.from_numpy(previous_data)).cpu()
 
             if of is not None:
                 export_prediction_from_logits(prediction, data_properties, self.configuration_manager, self.plans_manager,

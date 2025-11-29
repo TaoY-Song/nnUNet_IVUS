@@ -4,13 +4,13 @@
 # 配置参数
 # ========================================
 DATASET_NAME="Dataset002_IVUS"
-RESULTS_FOLDER="/data/taoyusong/nnUNet/nnUNetFrame/DATASET/nnUNet_results/Dataset002_IVUS/nnUNetTrainer__nnUNetPlans__2d"
+RESULTS_FOLDER="/data/taoyusong/nnUNet_IVUS/nnUNet/nnUNetFrame/DATASET/nnUNet_results/Dataset002_IVUS/nnUNetTrainer__nnUNetPlans__2d"
 TRAINER_NAME="nnUNetTrainer"
 PLANS_NAME="nnUNetPlans"
 CONFIG="2d"
-INPUT_FOLDER="/data/taoyusong/nnUNet/nnUNetFrame/DATASET/nnUNet_inference/all_IVUS"
-OUTPUT_FOLDER="/data/taoyusong/nnUNet/nnUNetFrame/DATASET/nnUNet_inference/all_IVUS_output"
-OUTPUT_FOLDER_PP="/data/taoyusong/nnUNet/nnUNetFrame/DATASET/nnUNet_inference/all_IVUS_output_postprocessing"
+INPUT_FOLDER="/data/taoyusong/nnUNet_IVUS/nnUNet/nnUNetFrame/DATASET/nnUNet_inference/all_IVUS"
+OUTPUT_FOLDER="/data/taoyusong/nnUNet_IVUS/nnUNet/nnUNetFrame/DATASET/nnUNet_inference/all_IVUS_output"
+OUTPUT_FOLDER_PP="/data/taoyusong/nnUNet_IVUS/nnUNet/nnUNetFrame/DATASET/nnUNet_inference/all_IVUS_output_postprocessing"
 PP_PKL_FILE="${RESULTS_FOLDER}/crossval_results_folds_0_1_2_3_4/postprocessing.pkl"
 PLANS_JSON_FILE="${RESULTS_FOLDER}/crossval_results_folds_0_1_2_3_4/plans.json"
 

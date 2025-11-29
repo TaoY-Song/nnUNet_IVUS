@@ -132,27 +132,61 @@ class nnUNetDatasetBlosc2(nnUNetBaseDataset):
         dparams = {
             'nthreads': 1
         }
-        data_b2nd_file = join(self.source_folder, identifier + '.b2nd')
-
         # mmap does not work with Windows -> https://github.com/MIC-DKFZ/nnUNet/issues/2723
         mmap_kwargs = {} if os.name == "nt" else {'mmap_mode': 'r'}
-        data = blosc2.open(urlpath=data_b2nd_file, mode='r', dparams=dparams, **mmap_kwargs)
+        
+        # ========== 🔥 加载 current_data ========== #
+        data_b2nd_file = join(self.source_folder, identifier + '.b2nd')
+        current_data = blosc2.open(
+            urlpath=data_b2nd_file,
+            mode='r', 
+            dparams=dparams, 
+            **mmap_kwargs
+        )
 
+        # ========== 🔥 加载 segmentation ========== #
         seg_b2nd_file = join(self.source_folder, identifier + '_seg.b2nd')
-        seg = blosc2.open(urlpath=seg_b2nd_file, mode='r', dparams=dparams, **mmap_kwargs)
-
+        seg = blosc2.open(
+            urlpath=seg_b2nd_file, 
+            mode='r', 
+            dparams=dparams, 
+            **mmap_kwargs
+        )
+        
         if self.folder_with_segs_from_previous_stage is not None:
             prev_seg_b2nd_file = join(self.folder_with_segs_from_previous_stage, identifier + '.b2nd')
             seg_prev = blosc2.open(urlpath=prev_seg_b2nd_file, mode='r', dparams=dparams, **mmap_kwargs)
         else:
             seg_prev = None
 
+        # ========== 加载 properties ========== #
         properties = load_pickle(join(self.source_folder, identifier + '.pkl'))
-        return data, seg, seg_prev, properties
+        
+        # return current_data, seg, seg_prev, properties
+
+       
+        # ========== 🔥 加载 previous_data ========== #
+        previous_data_b2nd_file = join(self.source_folder, identifier + '_previous.b2nd')
+        if isfile(previous_data_b2nd_file):
+            previous_data = blosc2.open(
+                urlpath=previous_data_b2nd_file, 
+                mode='r', 
+                dparams=dparams, 
+                **mmap_kwargs
+            )
+        else:
+            # 如果没有 previous 文件，使用 current 作为 previous（第一帧情况）
+            previous_data = current_data
+        
+       
+        # ========== 🔥 返回格式：增加 previous_data ========== #
+        # 返回顺序: current_data, seg, properties, previous_data
+        return current_data, previous_data, seg, seg_prev, properties
 
     @staticmethod
     def save_case(
             data: np.ndarray,
+            previous_data: np.ndarray,
             seg: np.ndarray,
             properties: dict,
             output_filename_truncated: str,
@@ -160,6 +194,8 @@ class nnUNetDatasetBlosc2(nnUNetBaseDataset):
             blocks=None,
             chunks_seg=None,
             blocks_seg=None,
+            chunks_previous=None,
+            blocks_previous=None,            
             clevel: int = 8,
             codec=blosc2.Codec.ZSTD
     ):
@@ -168,7 +204,11 @@ class nnUNetDatasetBlosc2(nnUNetBaseDataset):
             chunks_seg = chunks
         if blocks_seg is None:
             blocks_seg = blocks
-
+        if chunks_previous is None:
+            chunks_previous = chunks
+        if blocks_previous is None:
+            blocks_previous = blocks
+           
         cparams = {
             'codec': codec,
             # 'filters': [blosc2.Filter.SHUFFLE],
@@ -180,7 +220,10 @@ class nnUNetDatasetBlosc2(nnUNetBaseDataset):
                        blocks=blocks, cparams=cparams)
         blosc2.asarray(np.ascontiguousarray(seg), urlpath=output_filename_truncated + '_seg.b2nd', chunks=chunks_seg,
                        blocks=blocks_seg, cparams=cparams)
+        blosc2.asarray(np.ascontiguousarray(previous_data), urlpath=output_filename_truncated + '_previous.b2nd', chunks=chunks_previous,
+                       blocks=blocks_previous, cparams=cparams)
         write_pickle(properties, output_filename_truncated + '.pkl')
+         
 
     @staticmethod
     def save_seg(
@@ -197,6 +240,12 @@ class nnUNetDatasetBlosc2(nnUNetBaseDataset):
         returns all identifiers in the preprocessed data folder
         """
         case_identifiers = [i[:-5] for i in os.listdir(folder) if i.endswith(".b2nd") and not i.endswith("_seg.b2nd")]
+        case_identifiers = [
+        i[:-5] for i in os.listdir(folder) 
+        if i.endswith(".b2nd") 
+        and not i.endswith("_seg.b2nd") 
+        and not i.endswith("_previous.b2nd")  # 🔥 排除 previous 文件
+        ]
         return case_identifiers
 
     @staticmethod

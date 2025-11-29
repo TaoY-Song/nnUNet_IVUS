@@ -4,12 +4,12 @@
 
 DATASET_ID="2"
 CONFIG="2d"
-TRAINER="nnUNetTrainer"
-PLANS="nnUNetPlans"
+# TRAINER="nnUNetTrainer"
+# PLANS="nnUNetPlans"
 AVAILABLE_GPUS=(0 1 2 3)
 MAX_RETRIES=10
 
-BASE_RESULTS_DIR="/data/taoyusong/nnUNet/nnUNetFrame/DATASET/nnUNet_results/Dataset002_IVUS/${TRAINER}__${PLANS}__${CONFIG}"
+# BASE_RESULTS_DIR="/data/taoyusong/nnUNet_IVUS/nnUNet/nnUNetFrame/DATASET/nnUNet_results/Dataset002_IVUS/${TRAINER}__${PLANS}__${CONFIG}"
 
 get_gpu_process_count() {
     local gpu_id=$1
